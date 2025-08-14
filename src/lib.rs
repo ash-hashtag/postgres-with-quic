@@ -1,12 +1,11 @@
-mod pool;
+pub mod pool;
 
-use deadpool_postgres::{ManagerConfig, StatementCaches};
 use pin_project::pin_project;
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::Path,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll},
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -25,7 +24,6 @@ use tokio::{
 };
 use tokio_postgres::NoTls;
 
-use tokio_postgres::GenericClient;
 pub async fn make_quicc_conn(
     client_cfg: ClientConfig,
     connect_to: SocketAddr,

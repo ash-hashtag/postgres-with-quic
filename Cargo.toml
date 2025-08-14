@@ -6,7 +6,6 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
-criterion = { version = "0.7.0", features = ["async_tokio"] }
 deadpool = "0.12.2"
 deadpool-postgres = "0.14.1"
 futures = "0.3.31"
