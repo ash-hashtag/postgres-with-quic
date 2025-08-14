@@ -1607,6 +1607,7 @@ dependencies = [
  "s2n-quic-core",
  "s2n-quic-crypto",
  "s2n-quic-platform",
+ "s2n-quic-rustls",
  "s2n-quic-tls-default",
  "s2n-quic-transport",
  "tokio",

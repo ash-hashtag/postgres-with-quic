@@ -1,3 +1,5 @@
+mod pool;
+
 use deadpool_postgres::{ManagerConfig, StatementCaches};
 use pin_project::pin_project;
 use std::{
@@ -23,6 +25,7 @@ use tokio::{
 };
 use tokio_postgres::NoTls;
 
+use tokio_postgres::GenericClient;
 pub async fn make_quicc_conn(
     client_cfg: ClientConfig,
     connect_to: SocketAddr,
@@ -177,15 +180,8 @@ where
     }
 }
 
-pub struct QuicManager {
-    config: ManagerConfig,
-    pg_config: tokio_postgres::Config,
-    connection: quinn::Connection,
-}
-
 pub struct QuicConnector {
-    quic_client_cfg: quinn::ClientConfig,
-    connection: quinn::Connection,
+    connection: Arc<tokio::sync::Mutex<s2n_quic::Connection>>,
 }
 
 impl deadpool_postgres::Connect for QuicConnector {
@@ -202,6 +198,33 @@ impl deadpool_postgres::Connect for QuicConnector {
                 > + Send,
         >,
     > {
-        Box::pin(async move { todo!() })
+        let conn = self.connection.clone();
+        let pg_config = pg_config.clone();
+        Box::pin(async move {
+            let mut conn = conn.lock().await;
+            let stream = match conn.open_bidirectional_stream().await {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("{}", err);
+                    let (client, conn) = pg_config.connect(NoTls).await?;
+
+                    let handle = tokio::spawn(async move {
+                        if let Err(err) = conn.await {
+                            eprintln!("Connection closed {}", err);
+                        }
+                    });
+                    return Ok((client, handle));
+                }
+            };
+
+            let (client, conn) = pg_config.connect_raw(stream, NoTls).await?;
+
+            let handle = tokio::spawn(async move {
+                if let Err(err) = conn.await {
+                    eprintln!("Connection closed {}", err);
+                }
+            });
+            return Ok((client, handle));
+        })
     }
 }

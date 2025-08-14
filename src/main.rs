@@ -1,5 +1,10 @@
+use futures::task::UnsafeFutureObj;
 use postgres_with_quic::*;
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, atomic::AtomicU64},
+    time::Instant,
+};
+use tokio::sync::Mutex;
 use tokio_postgres::NoTls;
 
 #[tokio::main]
@@ -21,15 +26,25 @@ async fn main() {
     config.ssl_mode(tokio_postgres::config::SslMode::Require);
 
     let root_store = Arc::new(build_root_cert_store(tls_cert_path.as_str()));
+    let connect = tls_connect(root_store);
+    let (client, conn) = config.connect(connect.clone()).await.unwrap();
+    let client = Arc::new(client);
+    let handle = tokio::spawn(conn);
+    let mut handles = Vec::with_capacity(100);
     let instant = Instant::now();
-    let (client, conn) = config.connect(tls_connect(root_store)).await.unwrap();
-    let _ = tokio::spawn(conn);
-    let _ = client.query(query, &[]).await.unwrap();
-
+    for _ in 0..100 {
+        let client = client.clone();
+        let h = tokio::spawn(async move {
+            let _ = client.query(query, &[]).await.unwrap();
+        });
+        handles.push(h);
+    }
+    futures::future::join_all(handles).await;
     println!(
-        "default connection took: {} ms",
+        "Took {} ms from default connection",
         instant.elapsed().as_millis()
     );
+    handle.abort();
 
     quic_config.hostaddr(quic_db_addr.ip());
     quic_config.port(quic_db_addr.port());
@@ -37,16 +52,35 @@ async fn main() {
 
     let connect = s2n_quic::client::Connect::new(quic_db_addr).with_server_name("localhost");
     let quic_client = make_quicc_client(tls_cert_path.as_str());
-    let instant = Instant::now();
-    let mut conn = quic_client.connect(connect).await.unwrap();
-    let stream = conn.open_bidirectional_stream().await.unwrap();
 
-    let (client, conn) = quic_config.connect_raw(stream, NoTls).await.unwrap();
-    let _ = tokio::spawn(conn);
+    let conn = quic_client.connect(connect.clone()).await.unwrap();
+    let conn = Arc::new(Mutex::new(conn));
 
-    let _ = client.query(query, &[]).await.unwrap();
+    let mut handles = Vec::with_capacity(100);
+    for _ in 0..100 {
+        let quic_config = quic_config.clone();
+        let conn = conn.clone();
+        let h = tokio::spawn(async move {
+            let stream = { conn.lock().await.open_bidirectional_stream().await.unwrap() };
 
-    println!("quic connection took: {} ms", instant.elapsed().as_millis());
+            let (client, conn) = quic_config.connect_raw(stream, NoTls).await.unwrap();
+            let handle = tokio::spawn(conn);
+            let _ = client.query(query, &[]).await.unwrap();
+            let _ = client;
+            handle.abort();
+        });
+        handles.push(h);
+    }
+
+    futures::future::join_all(handles).await;
+    println!(
+        "Took {} ms from quic connections",
+        instant.elapsed().as_millis()
+    );
+    // println!(
+    //     "Average Quic Connection Establishment: {} ms",
+    //     sum.load(std::sync::atomic::Ordering::Relaxed) as f64 / (n * 1000) as f64
+    // );
     // let rows = make_connection_and_query(config, root_cert_store.clone(), query).await;
     // println!("Rows returned {}", rows.len());
 
@@ -99,3 +133,5 @@ async fn main() {
 
     // let _ = connection_end.await.unwrap();
 }
+
+async fn pool_test() {}
