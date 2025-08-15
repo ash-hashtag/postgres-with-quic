@@ -49,6 +49,7 @@ impl QuicManager {
             tokio_postgres::config::Host::Tcp(name) => name,
             _ => return Err(anyhow::anyhow!("No host name found")),
         };
+        println!("Connecting QUIC to {}, with name: {}", addr, hostname);
         let connect = s2n_quic::client::Connect::new(addr).with_server_name(hostname.as_str());
         Ok(Self {
             connection: Mutex::new(None),
@@ -106,7 +107,7 @@ impl deadpool::managed::Manager for QuicManager {
     async fn recycle(
         &self,
         obj: &mut Self::Type,
-        _: &deadpool_postgres::Metrics,
+        _: &deadpool::managed::Metrics,
     ) -> deadpool::managed::RecycleResult<Self::Error> {
         if obj.is_closed() {
             return Err(deadpool::managed::RecycleError::Message(
@@ -150,7 +151,7 @@ impl deadpool::managed::Manager for TcpManager {
     async fn recycle(
         &self,
         obj: &mut Self::Type,
-        _: &deadpool_postgres::Metrics,
+        _: &deadpool::managed::Metrics,
     ) -> deadpool::managed::RecycleResult<Self::Error> {
         if obj.is_closed() {
             return Err(deadpool::managed::RecycleError::Message(
