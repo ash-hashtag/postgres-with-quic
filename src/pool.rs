@@ -1,7 +1,7 @@
 use std::{
     net::SocketAddr,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicI64},
 };
 
 use s2n_quic::provider::limits::Limits;
@@ -11,12 +11,18 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 type PgClient = tokio_postgres::Client;
 
+struct QuicConnectionWrapper {
+    connection: s2n_quic::Connection,
+    number_of_streams: Arc<AtomicI64>,
+}
+
 pub struct QuicManager {
-    connection: tokio::sync::Mutex<Option<s2n_quic::Connection>>,
+    connection: tokio::sync::Mutex<Option<QuicConnectionWrapper>>,
     pg_config: tokio_postgres::Config,
     connect: s2n_quic::client::Connect,
     client: s2n_quic::Client,
     always_open_a_new_connection: bool,
+    streams_per_connection: u64,
 }
 
 impl QuicManager {
@@ -24,6 +30,7 @@ impl QuicManager {
         tls: Arc<rustls::ClientConfig>,
         config: tokio_postgres::Config,
         always_open_a_new_connection: bool,
+        streams_per_connection: u64,
     ) -> anyhow::Result<Self> {
         if config.get_hosts().is_empty()
             || config.get_hostaddrs().is_empty()
@@ -39,8 +46,8 @@ impl QuicManager {
             .with_io("0.0.0.0:0")?
             .with_limits(
                 Limits::new()
-                    .with_max_open_local_bidirectional_streams(1000)?
-                    .with_max_open_remote_bidirectional_streams(1000)?,
+                    .with_max_open_local_bidirectional_streams(streams_per_connection)?
+                    .with_max_open_remote_bidirectional_streams(streams_per_connection)?,
             )?
             .start()?;
 
@@ -57,30 +64,54 @@ impl QuicManager {
             connect,
             client,
             always_open_a_new_connection,
+            streams_per_connection,
         })
     }
 
-    async fn open_stream(&self) -> anyhow::Result<s2n_quic::stream::BidirectionalStream> {
+    async fn open_stream(
+        &self,
+    ) -> anyhow::Result<(s2n_quic::stream::BidirectionalStream, Arc<AtomicI64>)> {
         if self.always_open_a_new_connection {
             let mut connection = self.client.connect(self.connect.clone()).await?;
             let s = connection.open_bidirectional_stream().await?;
-            return Ok(s);
+            return Ok((s, Arc::new(AtomicI64::new(1))));
         }
 
         let mut conn = self.connection.lock().await;
 
         if let Some(connection) = &mut *conn {
-            if let Ok(s) = connection.open_bidirectional_stream().await {
-                return Ok(s);
+            if connection
+                .number_of_streams
+                .load(std::sync::atomic::Ordering::Relaxed)
+                < self.streams_per_connection as i64
+            {
+                match connection.connection.open_bidirectional_stream().await {
+                    Ok(s) => {
+                        connection
+                            .number_of_streams
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok((s, connection.number_of_streams.clone()));
+                    }
+                    Err(err) => {
+                        println!("Failed to open stream: {}", err);
+                    }
+                }
             }
         }
         {
+            println!("Creating new Connection ");
             let mut connection = self.client.connect(self.connect.clone()).await?;
 
             let s = connection.open_bidirectional_stream().await?;
-            *conn = Some(connection);
 
-            return Ok(s);
+            let number_of_streams = Arc::new(AtomicI64::new(1));
+
+            *conn = Some(QuicConnectionWrapper {
+                connection,
+                number_of_streams: number_of_streams.clone(),
+            });
+
+            return Ok((s, number_of_streams));
         }
     }
 }
@@ -91,7 +122,7 @@ impl deadpool::managed::Manager for QuicManager {
     type Error = anyhow::Error;
 
     async fn create(&self) -> Result<Self::Type, Self::Error> {
-        let stream = self.open_stream().await?;
+        let (stream, number_of_streams) = self.open_stream().await?;
 
         let (client, connection) = self.pg_config.connect_raw(stream, NoTls).await?;
 
@@ -99,6 +130,8 @@ impl deadpool::managed::Manager for QuicManager {
             if let Err(err) = connection.await {
                 eprintln!("{}", err);
             }
+
+            number_of_streams.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
 
         Ok(ClientWrapper::new(client, conn_task))

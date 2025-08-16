@@ -2,10 +2,10 @@
 
 
 # Run client metrics in background
-./collect_client_metrics.sh > ./metrics/client_tcp_metrics.csv &
+./collect_client_metrics.sh &
 pid1=$!
 # Run server metrics in background
-./collect_pgcat_metrics.sh > ./metrics/server_tcp_metrics.csv &
+./collect_pgcat_metrics.sh &
 pid2=$!
 
 # Wait for either to exit

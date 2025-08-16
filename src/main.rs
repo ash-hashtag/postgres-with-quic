@@ -1,5 +1,5 @@
 use postgres_with_quic::{
-    build_root_cert_store, make_quic_connection2,
+    build_root_cert_store,
     pool::{ClientWrapper, QuicManager, TcpManager},
 };
 use std::{
@@ -65,25 +65,25 @@ async fn run() {
 
     client_cfg.alpn_protocols.push("h3".as_bytes().to_vec());
 
-    let (tx, rx) = tokio::sync::mpsc::channel(16); // they are consumed immediately anyway
+    let (tx, rx) = tokio::sync::mpsc::channel(1024); // they are consumed immediately anyway
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    // let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
-    let f1 = send_queries(
+    let f1 = tokio::spawn(send_queries(
         tx,
         query,
         start_rate,
         end_rate,
         Duration::from_secs(ramp_duration_secs),
-    );
+    ));
 
-    let f2 = collect_metrics(
+    let f2 = tokio::spawn(collect_metrics(
         active_queries.clone(),
         query_times.clone(),
         metrics_file_path,
         Duration::from_millis(metrics_interval),
-        shutdown_rx,
-    );
+        // shutdown_rx,
+    ));
 
     if using_quic {
         println!("Using QUIC");
@@ -91,8 +91,19 @@ async fn run() {
             Ok(s) => s == "true",
             Err(_) => false,
         };
-        let manager =
-            QuicManager::new(Arc::new(client_cfg), config, always_open_a_new_connection).unwrap();
+
+        let streams_per_connection = match var("QUIC_STREAMS_PER_CONN") {
+            Ok(val) => val.parse::<u64>().unwrap_or(100),
+            Err(_) => 100,
+        };
+
+        let manager = QuicManager::new(
+            Arc::new(client_cfg),
+            config,
+            always_open_a_new_connection,
+            streams_per_connection,
+        )
+        .unwrap();
 
         let f3 = pool_test(
             manager,
@@ -100,9 +111,9 @@ async fn run() {
             rx,
             active_queries.clone(),
             query_times.clone(),
-            shutdown_tx,
+            // shutdown_tx,
         );
-        futures::future::join3(f1, f2, f3).await;
+        let _ = futures::future::join3(f1, f2, f3).await;
     } else {
         println!("Using TCP");
         let manager = TcpManager::new(config, client_cfg);
@@ -113,9 +124,9 @@ async fn run() {
             rx,
             active_queries.clone(),
             query_times.clone(),
-            shutdown_tx,
+            // shutdown_tx,
         );
-        futures::future::join3(f1, f2, f3).await;
+        let _ = futures::future::join3(f1, f2, f3).await;
     }
 }
 
@@ -124,7 +135,7 @@ async fn collect_metrics(
     query_times: Arc<Mutex<Vec<u64>>>,
     metrics_file_path: String,
     interval: Duration,
-    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
+    // mut shutdown_rx: tokio::sync::watch::Receiver<()>,
 ) {
     let mut query_metrics_file = tokio::fs::OpenOptions::new()
         .write(true)
@@ -140,26 +151,29 @@ async fn collect_metrics(
         .unwrap();
 
     let mut tick_interval = tokio::time::interval(interval);
+    tick_interval.tick().await;
 
     loop {
-        tokio::select! {
-            _ = shutdown_rx.changed() => {
-                break;
-            }
-            _ = tick_interval.tick() => {
+        // tokio::select! {
+        //     _ = shutdown_rx.changed() => {
+        //         break;
+        //     }
+        //     _ = tick_interval.tick() => {
 
-            }
-        }
+        //     }
+        // }
 
         tick_interval.tick().await;
         let now = SystemTime::now();
         let now_ms = now.duration_since(UNIX_EPOCH).unwrap().as_millis();
 
+        let active_number_of_queries = active_queries.load(std::sync::atomic::Ordering::Relaxed);
+
         let (sum, len) = {
             let mut query_times = query_times.lock().unwrap();
             let len = query_times.len();
 
-            if len == 0 {
+            if len == 0 && active_number_of_queries == 0 {
                 break;
             }
 
@@ -177,10 +191,7 @@ async fn collect_metrics(
 
         let query_metric = format!(
             "{},{},{},{}\n",
-            now_ms,
-            active_queries.load(std::sync::atomic::Ordering::Relaxed),
-            len,
-            average,
+            now_ms, active_number_of_queries, len, average,
         );
 
         print!("{}", query_metric);
@@ -198,7 +209,7 @@ async fn pool_test<M>(
     mut incoming_queries: tokio::sync::mpsc::Receiver<String>,
     active_queries: Arc<AtomicI64>,
     query_times: Arc<Mutex<Vec<u64>>>,
-    shutdown_tx: tokio::sync::watch::Sender<()>,
+    // shutdown_tx: tokio::sync::watch::Sender<()>,
 ) where
     M: deadpool::managed::Manager<Type = ClientWrapper, Error = anyhow::Error> + Sync + 'static,
 {
@@ -229,7 +240,7 @@ async fn pool_test<M>(
         });
     }
 
-    let _ = shutdown_tx.send(()).unwrap();
+    // let _ = shutdown_tx.send(()).unwrap();
 }
 
 async fn send_queries(
@@ -243,28 +254,50 @@ async fn send_queries(
 
     let mut number_of_queries = 0;
 
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+
     loop {
+        let _ = interval.tick().await;
+
         let elapsed = start.elapsed().as_secs_f64();
 
         if elapsed > ramp_duration.as_secs_f64() {
             break; // stop at end of ramp
         }
         let progress = elapsed / ramp_duration.as_secs_f64();
-        let current_rate = start_rate + (end_rate - start_rate) * progress;
+        let current_rate = (start_rate + (end_rate - start_rate) * progress) as u64;
 
-        // adjust interval dynamically
-
-        let wait_period = Duration::from_secs_f64(1.0 / current_rate);
-
-        let _ = tokio::time::sleep(wait_period).await;
-
-        if let Err(err) = tx.send(query.clone()).await {
-            eprintln!("{}", err);
-            break;
+        for _ in 0..current_rate {
+            if let Err(err) = tx.send(query.clone()).await {
+                eprintln!("{}", err);
+                break;
+            }
         }
-
-        number_of_queries += 1;
+        number_of_queries += current_rate;
     }
+
+    // loop {
+    //     let elapsed = start.elapsed().as_secs_f64();
+
+    //     if elapsed > ramp_duration.as_secs_f64() {
+    //         break; // stop at end of ramp
+    //     }
+    //     let progress = elapsed / ramp_duration.as_secs_f64();
+    //     let current_rate = start_rate + (end_rate - start_rate) * progress;
+
+    //     // adjust interval dynamically
+
+    //     let wait_period = Duration::from_secs_f64(1.0 / current_rate);
+
+    //     let _ = tokio::time::sleep(wait_period).await;
+
+    //     if let Err(err) = tx.send(query.clone()).await {
+    //         eprintln!("{}", err);
+    //         break;
+    //     }
+
+    //     number_of_queries += 1;
+    // }
 
     println!(
         "Total number of queries sent {} in {} ms",
