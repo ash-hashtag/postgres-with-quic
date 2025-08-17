@@ -1,0 +1,1 @@
+podman run --rm --network=host --env-file .env.quic -e TEST_QUERY="SELECT trunc(random() * 100) AS value FROM generate_series(1, 10)" -v $(pwd)/certs:/certs -v $(pwd)/metrics:/metrics postgres-with-quic

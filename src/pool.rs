@@ -99,7 +99,6 @@ impl QuicManager {
             }
         }
         {
-            println!("Creating new Connection ");
             let mut connection = self.client.connect(self.connect.clone()).await?;
 
             let s = connection.open_bidirectional_stream().await?;
