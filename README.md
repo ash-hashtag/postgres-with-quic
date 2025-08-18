@@ -17,11 +17,14 @@ A pool basically makes multiple synchronous connections and allows queries to ru
 For example, if an edge server has to process 100 requests at a time, and would require 100 database queries, it would have to establish 100 connections.
 It doesn't scale, you stop at a max_pool_size, and wait until a connection in pool is done with its query, hence increasing response times over time with more and more queries.
 
-Therefore using a single connection with concurrent queries is obviously a better choice, so why not http2 like TCP connection with multiplexing, and allow concurrent streams, Well not a bad idea, no real reason, I just wanted to have a look at QUIC, maybe I can see QUIC/UDP saves bandwidth and gives better latency, blah blah blah. But actually the default performance is actually worse than TCP, until we are hitting the limits of TCP.
+This is not a comparison between TCP or UDP or QUIC, QUIC is an application level protocol over UDP
+Similar results can be acheived using a protocol with multiplexing streams over TCP similar to http2, I just chose to use QUIC
 
-But anyway, the advantage is at using one single connection with multiple streams and we have achieved it
+This is only discussing the bottleneck for using synchronous postgres protocol per connection and spending time for just "waiting" instead of processing more queries in parallel
 
-using TCP with 1000 connections hits us with "too many open files", well thats one disadvantage of using it, which you can get around
+We are not modifying the postgres protocol anyway, it is still synchronous, we are just making more "virtual" connections over the same connection, increasing our throughput
+
+using the default TCP with 1000 connections hits us with "too many open files", well thats one disadvantage of using it, which you can get around
 
 But... using one connection with 1000 streams has an advantage of not even thinking about the limit
 
@@ -31,23 +34,24 @@ for example, a roundtrip from a client to pooler might be around 100ms, but from
 
 So the concurrency/parallelism would drop even lower even with using a pool, a client in the pool can't be freed for the next request until 100ms
 
-And it becomes very inefficient to have 1000 active but just waiting TCP connections to same server
+And it becomes very inefficient to have 1000 active but just waiting TCP connections to the same server
 
 So using QUIC would allow us to even open up millions (not necessary) of streams split over multiple connections, and it is the pooler on that side's problem how to deal with that large number of streams, which probably can be further optimized, as right now the updated pgcat, just takes QUIC streams and passes onto the existing stream handler (tcp) 
 
 
-As from the collected metrics, for less number of connections we can have more concurrent queries with lower latency using QUIC compared to the default TCP. The pool method can be further optimized
+As from the collected metrics, for far less number of connections we can have more concurrent queries with lower latency using QUIC compared to the default TCP. The pool method can be further optimized
 
 
 Here is a comparison using 500 TCP connections vs 50 QUIC connections with 40 streams with the settings from .env.quic .env.tcp files in the repo
 
 ![Quic-Tcp-Comparision](/metrics/tcp-quic-comparison-metrics.webp)
 
+Its not even a fair comparison
+
 Overall CPU usage is higher with QUIC than TCP, that is expected, as we are processing more queries than default anyway
-But the latency and memory usage shows the obvious benifit
+But the latency and memory usage shows the obvious benefit
 
-Or better yet? update the postgres protocol (make a different version) to have concurrent queries, then we don't have to find work arounds like these just to be able to handle multiple queries at once
+But In my opinion, It was much simpler than I expected to use QUIC alongside, QUIC can be just drop in placed, to have Clients and Poolers support it for better overall performance.
 
-But In my opinion, It was much simpler than I expected, QUIC can be just drop in placed, to have Clients and Poolers to support it for better overall performance.
+Even the poolers would not need to worry about "too many files", but the memory and cpu usage I'd expect to be pretty similar tho, QUIC isn't anymore efficient
 
-This is not about TCP vs QUIC, I've just used the terms to best fit the context.
