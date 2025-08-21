@@ -18,7 +18,7 @@ For example, if an edge server has to process 100 requests at a time, and would 
 It doesn't scale, you stop at a max_pool_size, and wait until a connection in pool is done with its query, hence increasing response times over time with more and more queries.
 
 This is not a comparison between TCP or UDP or QUIC, QUIC is an application level protocol over UDP
-Similar results can be acheived using a protocol with multiplexing streams over TCP similar to http2, I just chose to use QUIC
+Similar results can be acheived using a protocol with multiplexing streams over TCP similar to http2 or some other multiplexing layer, I just chose to use QUIC
 
 This is only discussing the bottleneck for using synchronous postgres protocol per connection and spending time for just "waiting" instead of processing more queries in parallel
 
@@ -55,3 +55,17 @@ But In my opinion, It was much simpler than I expected to use QUIC alongside, QU
 
 Even the poolers would not need to worry about "too many files", but the memory and cpu usage I'd expect to be pretty similar tho, QUIC isn't anymore efficient
 
+
+## Conclusion
+
+Obviously multiplexing streams over single connection is better than blocking and doing nothing on each connection
+But are there any real advantages to using QUIC than some other multiplexing layer just over TCP
+
+### Head of Line blocking
+
+One of the reasons QUIC was designed to avoid HOL blocking, in simple terms, if any packet is lost in a regular TCP connection, the entire connection halts until the packet is resent and acknowledged, so even with multiplexing multiple streams, one stream's problem would end up all the streams problem, and QUIC's streams wouldn't have this issue, each stream is almost independent.
+
+### 0-RTT 
+QUIC can re-establish connection faster than regular TCP connections, again exactly our use case, we have a pool of connections, that can be closed and resumed as quickly as possible
+
+In theory, QUIC is very suited for this application, but a better solution would be, since QUIC is application level protocol, and postgres is using their own application level protocol anyway, just making it concurrent (with multiplexing) would get rid of all the overhead, but this is not gonna happen, as how postgres manages its connections is very tied to its architecture design, thats why poolers exist.
